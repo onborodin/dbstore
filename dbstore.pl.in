@@ -1,0 +1,701 @@
+#!@perl@
+
+#------------
+#--- AUTH ---
+#------------
+
+package aAuth;
+
+use strict;
+use warnings;
+use POSIX qw(getpid setuid setgid geteuid getegid);
+use Cwd qw(cwd getcwd chdir);
+use Mojo::Util qw(md5_sum b64_decode dumper);
+use Apache::Htpasswd;
+
+sub new {
+    my ($class, $pwdfile) = @_;
+    my $self = {
+        pwdfile => $pwdfile,
+        errstr => undef
+    };
+    bless $self, $class;
+    return $self;
+}
+
+sub pwdfile {
+    my ($self, $pwdfile) = @_;
+    return $self->{pwdfile} unless $pwdfile;
+    $self->{pwdfile} = $pwdfile if $pwdfile;
+    $self;
+}
+
+sub auth {
+    my ($self, $authstr) = @_;
+    return undef unless $authstr;
+
+    my $hash = $self->split($authstr);
+    return undef unless $hash;
+    return undef unless -r $self->{pwdfile};
+
+    my $res = undef;
+    eval {
+        my $ht = Apache::Htpasswd->new( { passwdFile => $self->pwdfile, ReadOnly => 1 } );
+        $res = $ht->htCheckPassword(
+                            $hash->{username},
+                            $hash->{password}
+        );
+    };
+    return undef if $@;
+    $res;
+}
+
+sub username {
+    my ($self, $authstr) = @_;
+    return undef unless $authstr;
+    my $hash = $self->split($authstr);
+    return undef unless $hash;
+    $hash->{username} if $hash;
+}
+
+sub split {
+    my ($self, $authstr) = @_;
+    return undef unless $authstr;
+
+    my ($type, $enc) = split /\s+/, $authstr;
+    return undef unless ($type eq 'Basic' && $enc);
+
+    my ($username, $password) = split /:/, b64_decode($enc);
+    return undef unless ($username && $password);
+
+    { username => $username, password => $password };
+}
+
+1;
+
+#--------------
+#--- CONFIG ---
+#--------------
+
+package aConfig;
+
+use strict;
+use warnings;
+
+sub new {
+    my ($class, $file) = @_;
+    my $self = {
+        file => $file
+    };
+    bless $self, $class;
+    $self;
+}
+
+sub file {
+    my ($self, $name) = @_;
+    return $self->{'file'} unless $name;
+    $self->{'file'} = $name;
+    $self;
+}
+
+sub read {
+    my $self = shift;
+    return undef unless -r $self->file;
+    open my $fh, '<', $self->file;
+    my %res;
+    while (my $line = readline $fh) {
+        chomp $line;
+        $line =~ s/^\s+//g;
+
+        next if $line =~ /^#/;
+        next if $line =~ /^;/;
+        next unless $line =~ /[=]/;
+
+        $line =~ s/[\"\']//g;
+        my ($key, $rawvalue) = split(/==|=>|=/, $line);
+        next unless $rawvalue and $key;
+
+        my ($value, $comment) = split(/[#;,]/, $rawvalue);
+
+        $key =~ s/^\s+|\s+$//g;
+        $value =~ s/^\s+|\s+$//g;
+
+        $res{$key} = $value;
+    }
+    close $fh;
+    \%res;
+}
+
+1;
+
+#--------------
+#--- DAEMON ---
+#--------------
+
+package aDaemon;
+
+use strict;
+use warnings;
+use POSIX qw(getpid setuid setgid geteuid getegid);
+use Cwd qw(cwd getcwd chdir);
+use Mojo::Util qw(dumper);
+
+sub new {
+    my ($class, $user, $group)  = @_;
+    my $self = {
+        user => $user,
+        group => $group
+    };
+    bless $self, $class;
+    return $self;
+}
+
+sub fork {
+    my $self = shift;
+
+    my $pid = fork;
+    if ($pid > 0) {
+        exit;
+    }
+    chdir("/");
+
+    my $uid = getpwnam($self->{user}) if $self->{user};
+    my $gid = getgrnam($self->{group}) if $self->{group};
+
+    setuid($uid) if $uid;
+    setgid($gid) if $gid;
+
+    open(my $stdout, '>&', STDOUT); 
+    open(my $stderr, '>&', STDERR);
+    open(STDOUT, '>>', '/dev/null');
+    open(STDERR, '>>', '/dev/null');
+    getpid;
+}
+
+1;
+
+
+#--------------------
+#--- CONTROLLER 1 ---
+#--------------------
+
+package DBstore::Controller;
+
+use utf8;
+use strict;
+use warnings;
+use Mojo::Base 'Mojolicious::Controller';
+use Mojo::Util qw(md5_sum dumper quote encode url_unescape);
+use Mojo::JSON qw(encode_json decode_json false true);
+use Time::Local;
+use File::Basename;
+use Filesys::Df;
+use File::stat;
+use POSIX;
+
+sub render_file {
+    my ($self, %args) = @_;
+
+    utf8::decode($args{filename}) if $args{filename} && !utf8::is_utf8($args{filename});
+    utf8::decode($args{filepath}) if $args{filepath} && !utf8::is_utf8($args{filepath});
+
+    my $filename = $args{filename};
+    my $status = $args{status} || 200;
+    my $content_disposition = $args{content_disposition}  || 'attachment';
+    my $cleanup = $args{cleanup} // 0;
+
+    # Content type based on format
+    my $content_type;
+    $content_type = $self->app->types->type($args{format}) if $args{format};
+    $content_type ||= 'application/octet-stream';
+
+    # Create asset
+    my $asset;
+    if (my $filepath = $args{filepath}) {
+        unless (-f $filepath && -r $filepath) {
+            # Error if file not found
+            return $self->rendered(404);
+        }
+        $filename ||= fileparse($filepath);
+        $asset = Mojo::Asset::File->new( path => $filepath );
+        $asset->cleanup($cleanup);
+    } elsif ( $args{data} ) {
+        $filename ||= $self->req->url->path->parts->[-1] || 'download';
+        $asset = Mojo::Asset::Memory->new();
+        $asset->add_chunk( $args{data} );
+    } else {
+        # You must provide "data" or "filepath" option
+        return;
+    }
+    # Set response headers
+    my $headers = $self->res->content->headers;
+
+    # Quote the filename, per RFC 5987
+    $filename = quote($filename);
+    $filename = encode("UTF-8", $filename);
+
+    $headers->add( 'Content-Type', $content_type . '; name=' . $filename );
+    $headers->add( 'Content-Disposition', $content_disposition . '; filename=' . $filename );
+
+    # Range, partially based on Mojolicious::Static
+    if ( my $range = $self->req->headers->range ) {
+        my $start = 0;
+        my $size  = $asset->size;
+        my $end   = $size - 1 >= 0 ? $size - 1 : 0;
+
+        # Check range
+        if ( $range =~ m/^bytes=(\d+)-(\d+)?/ && $1 <= $end ) {
+            $start = $1;
+            $end = $2 if defined $2 && $2 <= $end;
+
+            $status = 206;
+            $headers->add( 'Content-Length' => $end - $start + 1 );
+            $headers->add( 'Content-Range'  => "bytes $start-$end/$size" );
+        } else {
+            # Not satisfiable
+            return $self->rendered(416);
+        }
+        # Set range for asset
+        $asset->start_range($start)->end_range($end);
+    } else {
+        $headers->add( 'Content-Length' => $asset->size );
+    }
+    # Stream content directly from file
+    $self->res->content->asset($asset);
+    $self->rendered($status);
+}
+
+sub hello {
+    my $self = shift;
+    $self->render(json => { message => 'hello', success => 1 });
+}
+
+sub datadir {
+    my ($self, $dir) = @_;
+    return $self->app->config('datadir') unless $dir;
+    $self->app->config(datadir => $dir);
+    $self;
+}
+
+# --- API ---
+
+sub data_list {
+    my $self = shift;
+    my $dir = $self->datadir;
+    return $self->render(json => {}) unless -d $dir;
+
+    opendir(my $dirh, $dir);
+    my @list;
+    while (my $name = readdir($dirh)) {
+        next if ($name =~ m/^\./);
+        my $file = "$dir/$name";
+        next if -d $file;
+        next unless -r $file;
+
+        my $stat = stat($file);
+        my $mtime = strftime("%Y-%m-%d %H:%M:%S %Z", localtime($stat->mtime));
+        utf8::decode($name) if !utf8::is_utf8($name);
+        push (@list, { name => $name, mtime => $mtime, size => $stat->size });
+    }
+    closedir $dirh;
+    $self->render(json => { list => \@list, success => 1 });
+}
+
+sub data_profile {
+    my $self = shift;
+
+    my $name = $self->req->param('name');
+    return $self->render(json => { profile => [], success => 0 }) unless $name;
+
+    my $dir = $self->datadir;
+    my $file = "$dir/$name";
+    return $self->render(json => { profile => [], success => 0 }) unless -r $file;
+
+    my $stat = stat($file);
+    my $mtime = strftime("%Y-%m-%d %H:%M:%S %Z", localtime($stat->mtime));
+    utf8::decode($name) if !utf8::is_utf8($name);
+
+    my @list;
+    push (@list, { name => $name, mtime => $mtime, size => $stat->size });
+    $self->render(json => { profile => \@list, success => 1 });
+}
+
+sub data_put {
+    my $self = shift;
+    my $dir = $self->datadir;
+
+    return $self->render(json => { list => [], success => 0 }) unless -d $dir;
+    return $self->render(json => { list => [], success => 0 }) unless -w $dir;
+
+    my @files;
+    my $uploads = $self->req->uploads;
+
+    foreach my $upload (@{$uploads}) {
+        my $name = $upload->filename;
+        utf8::decode($name) if utf8::is_utf8($name);
+        my $size = $upload->size;
+        $name =~ s/^[ \.]+/_/;
+
+        my $resfile = "$dir/$name";
+        $upload->move_to($resfile);
+
+        next unless -r $resfile;
+
+        my $stat = stat($resfile);
+        my $ressize = $stat->size;
+        unless ($size == $ressize) {
+            unlink $resfile if -r $resfile;
+            next;
+        }
+        my $mtime = strftime("%Y-%m-%d %H:%M:%S %Z", localtime($stat->mtime));
+        push @files, { name => $name, size => $size, mtime => $mtime };
+    }
+    $self->render(json => { list => \@files, success => 1 });
+}
+
+sub data_get {
+    my $self = shift;
+    my $name = $self->req->param('name');
+    return $self->rendered(404) unless $name;
+
+    utf8::decode($name);
+    my $dir = $self->datadir;
+    my $file = "$dir/$name";
+
+    return $self->rendered(404) unless -r $file;
+    return $self->rendered(404) unless -f $file;
+    $self->render_file(filepath => $file);
+}
+
+sub data_delete {
+    my $self = shift;
+
+    my $dir = $self->datadir;
+    my $name = $self->req->param('name');
+    return $self->render(json => { name => $name, success => 0 }) unless $name;
+    return $self->render(json => { name => $name, success => 0 }) unless -w $dir;
+
+    my $file = "$dir/$name";
+    utf8::decode($name);
+    return $self->render(json => { name => $name, success => 1}) unless -f $file;
+    return $self->render(json => { name => $name, success => 0 }) unless unlink($file);
+    $self->render(json => { name => $name, success => 1 });
+}
+
+sub store_profile {
+    my $self = shift;
+    my $dir = $self->datadir;
+    return $self->render(json => { success => 0 }) unless -d $dir;
+    my $df = df($dir, 1);
+    my $profile = { total => $df->{blocks}, free => $df->{bfree}};
+    $self->render(json => { profile => $profile, success => 1 });
+}
+
+
+sub ts2time {
+    my $time_stamp = shift;
+    my ($year, $mon, $mday, $hour, $min, $sec, $tz) = $time_stamp =~  m/(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-([-+\w]+)/;
+    my $time;
+    eval {
+        $time = timelocal($sec, $min, $hour, $mday, $mon-1, $year-1900);
+    };
+    return undef if $@;
+    $time;
+}
+
+
+sub dump_clean {
+    my $self = shift;
+
+    my $pattern = $self->req->param('pattern');
+    my $remain = $self->req->param('remain');
+
+    return $self->render(json => { success => 0 }) unless $pattern;
+    return $self->render(json => { success => 0 }) unless length $pattern;
+    return $self->render(json => { success => 0 }) unless $remain;
+
+    my $dir = $self->datadir;
+    return $self->render(json => { success => 11 }) unless -d $dir;
+
+
+    $pattern =~ s,\*,.*,g;
+
+    opendir(my $dirh, $dir);
+    my %hash;
+    while (my $name = readdir($dirh)) {
+        next if ($name =~ m/^\./);
+
+#        next unless ($name =~ m/^.*--.*--.*.(sqlz|sql.gz|sql.xz)$/);
+        next unless ($name =~ m/^$pattern$/);
+
+        my $file = "$dir/$name";
+        next if -d $file;
+        next unless -r $file;
+
+        my $stat = stat($file);
+        my ($db_name, $time_stamp, $host) = split '--', $name;
+        my $mtime = ts2time $time_stamp;
+        next unless $mtime;
+        $hash{$mtime} = $name;
+
+    }
+    closedir $dirh;
+
+    foreach my $time (reverse sort {$a<=>$b} keys %hash) {
+        $remain -= 1;
+        next if $remain >= 0;
+        unlink "$dir/".$hash{$time};
+    }
+    return $self->render(json => { success => 1 });
+}
+
+1;
+
+#-----------
+#--- APP ---
+#-----------
+
+package DBstore;
+
+use strict;
+use warnings;
+use Mojo::Base 'Mojolicious';
+
+sub startup {
+    my $self = shift;
+}
+
+1;
+
+use POSIX qw(setuid setgid tzset tzname strftime);
+use Mojo::Server::Prefork;
+use Mojo::IOLoop::Subprocess;
+use Mojo::Util qw(md5_sum b64_decode getopt dumper);
+use Digest::MD5 qw(md5_hex);
+use Sys::Hostname qw(hostname);
+use File::Basename qw(basename dirname);
+use Apache::Htpasswd;
+use Cwd qw(getcwd abs_path);
+use EV;
+
+#------------
+#--- MAIN ---
+#------------
+
+my $appname = 'dbstore';
+
+#--------------
+#--- GETOPT ---
+#--------------
+
+getopt
+    'h|help' => \my $help,
+    'c|config=s' => \my $conffile,
+    'f|nofork' => \my $nofork,
+    'u|user=s' => \my $user,
+    'g|group=s' => \my $group;
+
+if ($help) {
+    print qq(
+Usage: app [OPTIONS]
+
+Options
+    -h | --help           This help
+    -c | --config=path    Path to config file
+    -u | --user=user      System owner of process
+    -g | --group=group    System group
+    -f | --nofork         Dont fork process
+
+
+The options override options from configuration file
+    )."\n";
+    exit 0;
+}
+
+
+#------------------
+#--- APP CONFIG ---
+#------------------
+
+my $server = Mojo::Server::Prefork->new;
+
+my $app = $server->build_app('DBstore');
+$app = $app->controller_class('DBstore::Controller');
+
+$app->secrets(['6d578e43ba88260e0375a1a35fd7954b']);
+$app->static->paths(['@app_libdir@/public']);
+$app->renderer->paths(['@app_libdir@/templs']);
+
+$app->config(conffile => $conffile || '@APP_CONFDIR@/dbstore.conf');
+$app->config(pwdfile => '@app_confdir@/dbstore.pw');
+$app->config(logfile => '@app_logdir@/dbstore.log');
+$app->config(loglevel => 'debug');
+$app->config(pidfile => '@app_rundir@/dbstore.pid');
+$app->config(crtfile => '@app_confdir@/dbstore.crt');
+$app->config(keyfile => '@app_confdir@/dbstore.key');
+
+$app->config(user => $user || '@app_user@');
+$app->config(group => $group || '@app_group@');
+
+$app->config(listenaddr4 => '0.0.0.0');
+#$app->config(listenaddr6 => '[::]');
+$app->config(listenport => '8184');
+
+$app->config(datadir => '@app_datadir@');
+$app->config(timezone => 'Europe/Moscow');
+
+if (-r $app->config('conffile')) {
+    $app->log->debug("Load configuration from ".$app->config('conffile'));
+    my $c = aConfig->new($app->config('conffile'));
+    my $hash = $c->read;
+
+    foreach my $key (keys %$hash) {
+        $app->config($key => $hash->{$key});
+    }
+}
+
+
+$app->max_request_size(10*1024*1024*1024);
+
+#---------------------------
+#--- MOJO GENERIC CONFIG ---
+#---------------------------
+
+#$ENV{MOJO_MAX_MESSAGE_SIZE} = 0;
+$ENV{MOJO_INACTIVITY_TIMEOUT} = 60;
+$ENV{MOJO_TMPDIR} = $app->config("datadir");
+
+$server->heartbeat_interval(3);
+$server->heartbeat_timeout(60);
+#$server->inactivity_timeout(60);
+$server->spare(2);
+$server->workers(2);
+
+#----------------
+#--- TIMEZONE ---
+#----------------
+$ENV{TZ} = $app->config('timezone');
+tzset;
+
+#---------------
+#--- HELPERS ---
+#---------------
+
+$app->helper('reply.exception' => sub { my $c = shift; $c->render(json => { message => 'exception', success => 0 }); });
+$app->helper('reply.not_found' => sub { my $c = shift; $c->render(json => { message => 'not_found', success => 0 }); });
+
+#--------------
+#--- ROUTES ---
+#--------------
+
+my $r = $app->routes;
+
+$r->add_condition(
+    auth => sub {
+        my ($route, $c) = @_;
+        my $log = $c->app->log;
+        my $authstr = $c->req->headers->authorization;
+        my $pwdfile = $c->app->config('pwdfile');
+
+        my $a = aAuth->new($pwdfile);
+
+        $log->info("Try auth user ". $a->username($authstr));
+        $a->auth($authstr);
+
+    }
+);
+
+$r->any('/hello')->over('auth')->to('controller#hello');
+$r->any('/data/list')->over('auth')->to('controller#data_list');
+$r->post('/data/put')->over('auth')->to('controller#data_put');
+$r->any('/data/get')->over('auth')->to('controller#data_get');
+$r->any('/data/delete')->over('auth')->to('controller#data_delete');
+$r->any('/data/profile')->over('auth')->to('controller#data_profile');
+$r->any('/store/profile')->over('auth')->to('controller#store_profile');
+$r->any('/dump/clean')->over('auth')->to('controller#dump_clean');
+
+#----------------
+#--- LISTENER ---
+#----------------
+
+my $tls = '?';
+$tls .= 'cert='.$app->config('crtfile');
+$tls .= '&key='.$app->config('keyfile');
+
+my $listen4;
+if ($app->config('listenaddr4')) {
+    $listen4 = "https://";
+    $listen4 .= $app->config('listenaddr4').':'.$app->config('listenport');
+    $listen4 .= $tls;
+}
+
+my $listen6;
+if ($app->config('listenaddr6')) {
+    $listen6 = "https://";
+    $listen6 .= $app->config('listenaddr6').':'.$app->config('listenport');
+    $listen6 .= $tls;
+}
+
+my @listen;
+push @listen, $listen4 if $listen4;
+push @listen, $listen6 if $listen6;
+
+$server->listen(\@listen);
+
+#--------------
+#--- DAEMON ---
+#--------------
+
+unless ($nofork) {
+    my $user = $app->config('user');
+    my $group = $app->config('group');
+
+    my $d = aDaemon->new($user, $group);
+
+    $d->fork;
+    $app->log(Mojo::Log->new(
+                path => $app->config('logfile'),
+                level => $app->config('loglevel')
+    ));
+}
+
+$server->pid_file($app->config('pidfile'));
+
+#---------------
+#--- WEB LOG ---
+#---------------
+
+$app->hook(before_dispatch => sub {
+        my $c = shift;
+
+        my $remote_address = $c->tx->remote_address;
+        my $method = $c->req->method;
+
+        my $base = $c->req->url->base->to_string;
+        my $path = $c->req->url->path->to_string;
+        my $loglevel = $c->app->log->level;
+        my $url = $c->req->url->to_abs->to_string;
+
+        unless ($loglevel eq 'debug') {
+            #$c->app->log->info("$remote_address $method $base$path");
+            $c->app->log->info("$remote_address $method $url");
+        }
+        if ($loglevel eq 'debug') {
+            $c->app->log->debug("$remote_address $method $url");
+        }
+});
+
+#----------------------
+#--- SIGNAL HANDLER ---
+#----------------------
+
+local $SIG{HUP} = sub {
+    $app->log->info('Catch HUP signal');
+    $app->log(Mojo::Log->new(
+                    path => $app->config('logfile'),
+                    level => $app->config('loglevel')
+    ));
+};
+
+$server->run;
+#EOF

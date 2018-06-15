@@ -1,0 +1,8 @@
+config.log
+config.status
+dbstore
+*~
+dbstore.service
+init.d/dbstore
+rc.d/dbstore
+Makefile
